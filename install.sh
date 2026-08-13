@@ -29,9 +29,9 @@ done
 
 [ -n "$DO_RC" ] || exit 0
 
-DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}
-BASH_DIR=${CLAUDE_COMPLETIONS_BASH_DIR:-$DATA_DIR/bash-completion/completions}
-ZSH_DIR=${CLAUDE_COMPLETIONS_ZSH_DIR:-$DATA_DIR/zsh/site-functions}
+# Ask the tool where it installed things, rather than re-deriving the defaults
+# here and drifting from them.
+eval "$("$TOOL" paths)"
 
 # Append a block once, identified by a marker pair.
 add_block() {
@@ -55,7 +55,7 @@ if command -v bash >/dev/null 2>&1; then
     if [ "$(uname -s)" = Darwin ] && [ -f "$HOME/.bash_profile" ]; then
         rc=$HOME/.bash_profile
     fi
-    add_block "$rc" "[ -r $BASH_DIR/claude ] && . $BASH_DIR/claude"
+    add_block "$rc" "[ -r $BASH_FILE ] && . $BASH_FILE"
 fi
 
 if command -v zsh >/dev/null 2>&1; then

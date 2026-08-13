@@ -1,9 +1,15 @@
 #!/usr/bin/env zsh
 # Validate a generated zsh completion without needing a terminal.
 #
-#  1. Every _arguments spec has balanced [] and ().
-#  2. Every completion function a spec names actually exists.
-#  3. Every dispatcher branch points at a function that exists.
+# It stubs _arguments, then parses each spec against the grammar zsh actually
+# uses:  OPT[description]:message:action
+#
+#   * the description must be terminated by an unescaped ]
+#   * what follows the description must be empty or start with :
+#   * a (...) action must have balanced parentheses
+#   * a function action must name a function that exists
+#
+# Parentheses inside a description are literal to zsh and are not checked.
 #
 # Usage: validate-zsh.zsh <path to _claude>
 
@@ -17,27 +23,74 @@ local file=$1
 local -a BAD
 integer nspec=0
 
-local -a BUILTIN_ACTIONS
-BUILTIN_ACTIONS=(_files _default _describe _normal _message _nothing)
+# Completion functions zsh provides that our stub environment will not define.
+local -a KNOWN_ACTIONS
+KNOWN_ACTIONS=(_files _default _describe _normal _message _nothing _values
+               _directories _command_names _hosts)
+
+# Split SPEC into description / message / action, reporting any grammar error.
+check_spec() {
+    local s=$1
+    integer i=1 n=${#s}
+    local ch desc='' rest=''
+
+    # option name, up to an unescaped [ or :
+    while (( i <= n )); do
+        ch=${s[i]}
+        [[ $ch == '\' ]] && { (( i += 2 )); continue }
+        [[ $ch == '[' || $ch == ':' ]] && break
+        (( i++ ))
+    done
+
+    if [[ ${s[i]} == '[' ]]; then
+        (( i++ ))
+        integer start=i closed=0
+        while (( i <= n )); do
+            ch=${s[i]}
+            [[ $ch == '\' ]] && { (( i += 2 )); continue }
+            [[ $ch == ']' ]] && { closed=1; break }
+            (( i++ ))
+        done
+        (( closed )) || { BAD+=("description not terminated -> $s"); return }
+        desc=${s[start,i-1]}
+        (( i++ ))
+    fi
+
+    rest=${s[i,n]}
+    [[ -z $rest ]] && return
+    if [[ $rest != :* ]]; then
+        BAD+=("trailing junk after description -> $s")
+        return
+    fi
+
+    # :message:action  — message may not contain an unescaped colon
+    local body=${rest#:}
+    local action=${body#*:}
+    [[ $body == *:* ]] || return   # ":" alone means "value required, no completion"
+
+    [[ -z $action ]] && return
+
+    if [[ $action == '('* ]]; then
+        local o=${#action//[^\(]/} c=${#action//[^\)]/}
+        (( o == c )) || BAD+=("unbalanced () in action -> $s")
+        return
+    fi
+
+    # A leading space means the action is a command with arguments.
+    local fn=${${action# }%% *}
+    if [[ $fn == _* ]]; then
+        (( $+functions[$fn] )) || (( ${KNOWN_ACTIONS[(I)$fn]} )) ||
+            BAD+=("missing function $fn -> $s")
+    fi
+}
 
 _arguments() {
-  local s
-  for s in "$@"; do
-    [[ $s == -[sCAS] ]] && continue
-    (( nspec++ ))
-
-    local open=${#s//[^\[]/} close=${#s//[^\]]/}
-    (( open != close )) && BAD+=("unbalanced [] -> $s")
-    local po=${#s//[^\(]/} pc=${#s//[^\)]/}
-    (( po != pc )) && BAD+=("unbalanced () -> $s")
-
-    if [[ $s == *:_[a-zA-Z_]* ]]; then
-      local fn=${${s##*:}%% *}
-      if [[ $fn == _* ]] && ${BUILTIN_ACTIONS[(r)$fn]:+false} true; then
-        (( $+functions[$fn] )) || BAD+=("missing function $fn -> $s")
-      fi
-    fi
-  done
+    local s
+    for s in "$@"; do
+        [[ $s == -[sCAS] ]] && continue
+        (( nspec++ ))
+        check_spec "$s"
+    done
 }
 _describe() { : }
 _files()    { : }

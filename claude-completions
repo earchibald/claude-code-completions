@@ -20,49 +20,57 @@ SPEC_FILE=$CACHE_DIR/spec.tsv
 META_FILE=$CACHE_DIR/meta
 
 # ---------------------------------------------------------------------------
-# Curated tables
+# Claude-specific knowledge
 #
-# `claude --help` exposes some enums machine-readably as `(choices: "a", "b")`.
-# The rest live here. Edit these when the CLI grows a value the parser cannot
-# see; everything else is discovered automatically.
+# Everything the generic help parser cannot see lives in this section, and
+# nowhere else. Edit it when the CLI grows a value or a quirk.
 # ---------------------------------------------------------------------------
 
-curated_choices() {
-    case $1 in
-        --model|--fallback-model)
-            echo 'fable opus sonnet haiku claude-fable-5 claude-opus-5 claude-sonnet-5 claude-haiku-4-5-20251001' ;;
-        --effort)          echo 'low medium high xhigh max' ;;
-        --setting-sources) echo 'user project local' ;;
-        --scope)           echo 'local user project' ;;
-        --transport)       echo 'stdio sse http' ;;
-        --tools|--allowed-tools|--allowedTools|--disallowed-tools|--disallowedTools)
-            echo 'Bash Edit Glob Grep Read Write WebFetch WebSearch NotebookEdit Task TodoWrite' ;;
-        --debug)           echo 'api hooks mcp file statsig' ;;
-        *)                 echo '' ;;
-    esac
-}
+# Commands not worth walking: `help` repeats its parent, and the other two run
+# a server rather than printing a help page.
+SKIP_COMMANDS='help serve gateway'
 
-# Options whose value is a comma-separated list of the choices above.
-is_comma_list() {
-    case $1 in
-        --setting-sources|--tools|--allowed-tools|--allowedTools|\
-        --disallowed-tools|--disallowedTools) return 0 ;;
-        *) return 1 ;;
-    esac
-}
+_TOOLS='Bash Edit Glob Grep Read Write WebFetch WebSearch NotebookEdit Task TodoWrite'
+_MODELS='fable opus sonnet haiku claude-fable-5 claude-opus-5 claude-sonnet-5 claude-haiku-4-5-20251001'
 
-# Options whose value is a path.
-value_kind() {
-    case $1 in
-        --add-dir|--plugin-dir|--cwd) echo dir ;;
-        --settings|--file|--mcp-config|--json-schema|--debug-file|\
-        --system-prompt|--append-system-prompt|--system-prompt-file|\
-        --append-system-prompt-file) echo file ;;
-        --agent)    echo agent ;;
-        --resume|-r) echo session ;;
-        --worktree|-w) echo branch ;;
-        *) echo '' ;;
-    esac
+# One row per option: name|kind|values
+#
+# kind drives both emitters:
+#   list       complete one of `values`
+#   commalist  complete a comma-separated series drawn from `values`
+#   dir file   path completion
+#   agent session branch   looked up live in the user's shell
+#
+# The CLI publishes some enums itself as `(choices: "a", "b")`; those are picked
+# up automatically and need no row here. A row wins over the parsed choices.
+curated_table() {
+    cat <<EOF
+--model|list|$_MODELS
+--fallback-model|list|$_MODELS
+--effort|list|low medium high xhigh max
+--debug|list|api hooks mcp file statsig
+--scope|list|local user project
+--transport|list|stdio sse http
+--setting-sources|commalist|user project local
+--tools|commalist|$_TOOLS
+--allowed-tools|commalist|$_TOOLS
+--allowedTools|commalist|$_TOOLS
+--disallowed-tools|commalist|$_TOOLS
+--disallowedTools|commalist|$_TOOLS
+--add-dir|dir|
+--plugin-dir|dir|
+--cwd|dir|
+--settings|file|
+--file|file|
+--mcp-config|file|
+--json-schema|file|
+--debug-file|file|
+--system-prompt|file|
+--append-system-prompt|file|
+--agent|agent|
+--resume|session|
+--worktree|branch|
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -98,14 +106,33 @@ meta_get() {
     awk -F= -v k="$1" '$1==k {print substr($0, length(k)+2); found=1} END{exit !found}' "$META_FILE"
 }
 
+# A command path such as "mcp add" becomes the identifier fragment "mcp_add".
+# The generated bash script rebuilds this at completion time, and the awk
+# emitters below have their own copy as vn(); all three must agree.
+varname() {
+    local s=${1:-root}
+    s=${s// /_}
+    printf '%s' "${s//-/_}"
+}
+
+# Where each shell's completion script is installed.
+shell_file() {
+    case $1 in
+        bash) printf '%s/claude' "$BASH_DIR" ;;
+        zsh)  printf '%s/_claude' "$ZSH_DIR" ;;
+        *)    die "unsupported shell: $1" ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # Help parser
+#
+# Produces, for one help page:
+#   opt <TAB> path <TAB> names <TAB> takesvalue <TAB> choices <TAB> description
+#   cmd <TAB> path <TAB> name  <TAB> description
 # ---------------------------------------------------------------------------
 
 read -r -d '' PARSE_AWK <<'AWK' || true
-# Emits TSV records for one help page.
-#   opt <TAB> path <TAB> names <TAB> takesvalue <TAB> choices <TAB> description
-#   cmd <TAB> path <TAB> name  <TAB> description
 BEGIN { mode = "" }
 
 /^Options:/  { flush(); mode = "opt"; next }
@@ -161,22 +188,19 @@ function flush(   sig, names, n, takes, choices, desc, tmp, m, cname) {
         desc = full; sub(/^ +/, "", desc)
         sub(/^--?[A-Za-z0-9][A-Za-z0-9-]*(, --?[A-Za-z0-9][A-Za-z0-9-]*)*( *[<[][^]>]*[]>])?/, "", desc)
         sub(/ *\(choices:.*/, "", desc)
-        desc = clean(desc)
 
-        printf "opt\t%s\t%s\t%d\t%s\t%s\n", path, names, takes, choices, desc
+        printf "opt\t%s\t%s\t%d\t%s\t%s\n", path, names, takes, choices, clean(desc)
     } else if (mode == "cmd") {
         desc = full; sub(/^ +/, "", desc)
         cname = desc
         sub(/ .*/, "", cname)
         sub(/^[^ ]+/, "", desc)
-        sub(/^ *(\[options\])?*/, "", desc)
         sub(/^ *(\[[^]]*\] *)*/, "", desc)
         sub(/^ *(<[^>]*> *)*/, "", desc)
         desc = clean(desc)
-        # Command help often runs into a long Examples block; keep one sentence.
-        if (match(desc, /\. /)) desc = substr(desc, 1, RSTART)
-        if (length(desc) > 100) desc = substr(desc, 1, 100)
-        desc = clean(desc)
+        # Command help often runs into a long Examples block. The summary is the
+        # first sentence; display width is the emitter's business, not ours.
+        if (match(desc, /\. /)) desc = clean(substr(desc, 1, RSTART))
         if (cname ~ /^[a-z][a-z0-9|-]*$/ && cname != "help")
             printf "cmd\t%s\t%s\t%s\n", path, cname, desc
     }
@@ -184,82 +208,86 @@ function flush(   sig, names, n, takes, choices, desc, tmp, m, cname) {
 }
 AWK
 
-# scrape <path...> — recursively walk the command tree.
+# Resolve each option's kind and values from the curated table, falling back to
+# the choices the CLI published itself. Runs once, so both emitters can read the
+# answer off the spec instead of each re-deriving it.
+read -r -d '' ENRICH_AWK <<'AWK' || true
+BEGIN { FS = "\t"; OFS = "\t" }
+
+# The curated table arrives as the first input file. Its rows are pipe-
+# separated, so they never look like a spec record.
+FNR == NR {
+    if ($0 == "") next
+    split($0, c, "|")
+    kind[c[1]] = c[2]; vals[c[1]] = c[3]
+    next
+}
+$1 != "opt" { print; next }
+{
+    k = ""; v = ""
+    if ($4 == 1) {
+        cnt = split($3, nm, " ")
+        for (j = 1; j <= cnt; j++) {
+            if (nm[j] in kind) { k = kind[nm[j]]; v = vals[nm[j]]; break }
+        }
+        if (k == "" && $5 != "") { k = "list"; v = $5 }
+        else if (v == "" && (k == "list" || k == "commalist") && $5 != "") v = $5
+    }
+    print $1, $2, $3, $4, k, v, $6
+}
+AWK
+
+# scrape <path...> — walk the command tree, emitting raw spec records.
 scrape() {
-    local path="$*"
-    local help
+    local path="$*" help records
     help=$(run_help $path)
     [ -n "$help" ] || return 0
 
-    printf '%s\n' "$help" | awk -v path="$path" "$PARSE_AWK"
+    records=$(printf '%s\n' "$help" | awk -v path="$path" "$PARSE_AWK")
+    printf '%s\n' "$records"
 
-    # Recurse only into the primary name of each command (aliases share it).
-    local depth=$#
-    [ "$depth" -ge 3 ] && return 0
+    [ $# -ge 3 ] && return 0
 
-    local names name
-    names=$(printf '%s\n' "$help" | awk -v path="$path" "$PARSE_AWK" |
-            awk -F'\t' -v p="$path" '$1=="cmd" && $2==p {print $3}')
-    for name in $names; do
+    # Recurse into the primary name of each command; aliases share its page.
+    local name
+    for name in $(printf '%s\n' "$records" |
+                  awk -F'\t' -v p="$path" '$1=="cmd" && $2==p {print $3}'); do
         name=${name%%|*}
-        case $name in
-            help|serve|gateway) continue ;;   # no useful children / may block
-        esac
+        case " $SKIP_COMMANDS " in *" $name "*) continue ;; esac
         scrape $path "$name"
     done
 }
 
 build_spec() {
     mkdir -p "$CACHE_DIR"
-    local tmp
-    tmp=$(mktemp)
-    scrape > "$tmp"
-    # Alias names are recorded as separate commands so they complete too.
-    LC_ALL=C sort -u "$tmp" | awk -F'\t' -v OFS='\t' '
+    # Alias names become separate commands so they complete too.
+    scrape | awk -F'\t' -v OFS='\t' '
         $1=="cmd" && $3 ~ /\|/ {
             n = split($3, a, "|")
             for (i = 1; i <= n; i++) { $3 = a[i]; print }
             next
         }
         { print }
-    ' | LC_ALL=C sort -u
-    rm -f "$tmp"
-}
-
-# ---------------------------------------------------------------------------
-# Emitters
-# ---------------------------------------------------------------------------
-
-varname() {
-    printf '%s' "$1" | tr ' -' '__' | tr -cd 'A-Za-z0-9_'
+    ' | awk "$ENRICH_AWK" <(curated_table) - | LC_ALL=C sort -u
 }
 
 spec_paths() {
     awk -F'\t' '{print $2}' "$1" | LC_ALL=C sort -u
 }
 
-# Every option name in the spec that takes a value, plus its choices.
-emit_choices_case() {
-    local spec=$1 name choices kind
-    local seen=' '
-    while IFS= read -r name; do
-        case $seen in *" $name "*) continue ;; esac
-        seen="$seen$name "
-        choices=$(awk -F'\t' -v n="$name" '$1=="opt" {
-            split($3, a, " ")
-            for (i in a) if (a[i]==n && $5!="") { print $5; exit }
-        }' "$spec")
-        [ -n "$choices" ] || choices=$(curated_choices "$name")
-        kind=$(value_kind "$name")
-        [ -n "$choices" ] || [ -n "$kind" ] || continue
-        printf '        %s) __kind=%s; __vals=%s ;;\n' \
-            "$name" "${kind:-list}" "$(printf '%q' "$choices")"
-    done < <(awk -F'\t' '$1=="opt" && $4==1 {split($3,a," "); for (i in a) print a[i]}' "$spec")
-}
+# ---------------------------------------------------------------------------
+# Emitters
+#
+# Both read the enriched spec only. Neither consults the curated table.
+# ---------------------------------------------------------------------------
+
+# Shared by the awk emitters; must agree with varname() above.
+read -r -d '' VN_AWK <<'AWK' || true
+function vn(p) { if (p == "") return "root"; gsub(/[ -]/, "_", p); return p }
+AWK
 
 emit_bash() {
     local spec=$1 version=$2 hash=$3
-    local p v
 
     cat <<EOF
 # bash completion for the Claude Code CLI — GENERATED, do not edit by hand.
@@ -271,15 +299,35 @@ emit_bash() {
 
 EOF
 
-    while IFS= read -r p; do
-        v=$(varname "${p:-root}")
-        printf '_claude_cmds_%s=%s\n' "$v" \
-            "$(printf '%q' "$(awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {print $3}' "$spec" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//')")"
-        printf '_claude_opts_%s=%s\n' "$v" \
-            "$(printf '%q' "$(awk -F'\t' -v p="$p" '$1=="opt" && $2==p {split($3,a," "); for (i in a) print a[i]}' "$spec" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//')")"
-        printf '_claude_valopts_%s=%s\n' "$v" \
-            "$(printf '%q' "$(awk -F'\t' -v p="$p" '$1=="opt" && $2==p && $4==1 {split($3,a," "); for (i in a) print a[i]}' "$spec" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//')")"
-    done < <(spec_paths "$spec")
+    # One pass builds the per-path command, option and value-option lists.
+    # Names are drawn from [A-Za-z0-9-] only, so plain quoting is safe.
+    awk -F'\t' "$VN_AWK"'
+    $1=="cmd" { add(cmds, $2, $3) }
+    $1=="opt" {
+        n = split($3, a, " ")
+        for (i = 1; i <= n; i++) {
+            add(opts, $2, a[i])
+            if ($4 == 1) add(valopts, $2, a[i])
+        }
+    }
+    { paths[$2] = 1 }
+    END {
+        for (p in paths) order[++k] = p
+        for (i = 1; i <= k; i++) {
+            p = order[i]; v = vn(p)
+            printf "_claude_cmds_%s=%s\n",    v, q(cmds[p])
+            printf "_claude_opts_%s=%s\n",    v, q(opts[p])
+            printf "_claude_valopts_%s=%s\n", v, q(valopts[p])
+        }
+    }
+    function add(arr, p, val,   key) {
+        key = p SUBSEP val
+        if (key in seen) return
+        seen[key] = 1
+        arr[p] = (arr[p] == "" ? val : arr[p] " " val)
+    }
+    function q(s) { return "'"'"'" s "'"'"'" }
+    ' "$spec" | LC_ALL=C sort
 
     cat <<'EOF'
 
@@ -320,33 +368,41 @@ _claude_value() {
     local __opt=$1 __cur=$2 __kind='' __vals=''
     case $__opt in
 EOF
-    emit_choices_case "$spec"
+
+    # One case arm per option name that resolves to a kind.
+    awk -F'\t' '
+    $1=="opt" && $5!="" {
+        n = split($3, a, " ")
+        for (i = 1; i <= n; i++) {
+            if (a[i] in done) continue
+            done[a[i]] = 1
+            printf "        %s) __kind=%s; __vals='"'"'%s'"'"' ;;\n", a[i], $5, $6
+        }
+    }' "$spec" | LC_ALL=C sort
+
     cat <<'EOF'
         *) return 1 ;;
     esac
 
     case $__kind in
-        dir)     COMPREPLY=($(compgen -d -- "$__cur")); compopt -o filenames 2>/dev/null ;;
-        file)    COMPREPLY=($(compgen -f -- "$__cur")); compopt -o filenames 2>/dev/null ;;
-        agent)   COMPREPLY=($(compgen -W "$(_claude_agent_names)" -- "$__cur")) ;;
-        session) COMPREPLY=($(compgen -W "$(_claude_session_ids)" -- "$__cur")) ;;
-        branch)  COMPREPLY=($(compgen -W "$(_claude_branches)" -- "$__cur")) ;;
-        *)
-            case $__opt in
-EOF
-    awk -F'\t' '$1=="opt" && $4==1 {split($3,a," "); for (i in a) print a[i]}' "$spec" |
-        LC_ALL=C sort -u | while IFS= read -r n; do
-            if is_comma_list "$n"; then printf '                %s) _claude_comma_list "$__vals" "$__cur"; return 0 ;;\n' "$n"; fi
-        done
-    cat <<'EOF'
-            esac
-            COMPREPLY=($(compgen -W "$__vals" -- "$__cur"))
-            ;;
+        dir)       COMPREPLY=($(compgen -d -- "$__cur")); compopt -o filenames 2>/dev/null ;;
+        file)      COMPREPLY=($(compgen -f -- "$__cur")); compopt -o filenames 2>/dev/null ;;
+        agent)     COMPREPLY=($(compgen -W "$(_claude_agent_names)" -- "$__cur")) ;;
+        session)   COMPREPLY=($(compgen -W "$(_claude_session_ids)" -- "$__cur")) ;;
+        branch)    COMPREPLY=($(compgen -W "$(_claude_branches)" -- "$__cur")) ;;
+        commalist) _claude_comma_list "$__vals" "$__cur" ;;
+        *)         COMPREPLY=($(compgen -W "$__vals" -- "$__cur")) ;;
     esac
     return 0
 }
 
 # --- main -------------------------------------------------------------------
+
+_claude_var() {
+    local s=${1:-root}
+    s=${s// /_}
+    printf '%s' "${s//-/_}"
+}
 
 _claude() {
     local cur prev words cword
@@ -388,31 +444,23 @@ _claude() {
     fi
 }
 
-_claude_var() {
-    local s=${1:-root}
-    s=${s// /_}
-    s=${s//-/_}
-    printf '%s' "$s"
-}
-
 complete -F _claude claude
 EOF
 }
 
-# _arguments specs are delimited by [ ] : ( ) and quoted with ' — strip every
-# one of them rather than trying to escape, and keep descriptions short.
-zsh_escape() {
-    printf '%s' "$1" |
-        tr -d '`\\"'"'" |
-        tr '[]():' '     ' |
-        tr -s ' ' |
-        cut -c1-70 |
-        sed 's/ *$//'
+# Escape a help description for use inside an _arguments spec, which is itself a
+# single-quoted shell word. Truncate first, so an escape is never cut in half.
+zsh_str() {
+    printf '%s' "$1" | cut -c1-70 | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/\[/\\[/g' -e 's/\]/\\]/g' -e 's/:/\\:/g' \
+        -e "s/'/'\\\\''/g" \
+        -e 's/ *$//'
 }
 
 emit_zsh() {
     local spec=$1 version=$2 hash=$3
-    local p v names name desc takes choices kind optspec
+    local all_paths p v names name desc takes kind vals optspec has_cmds child
 
     cat <<EOF
 #compdef claude
@@ -453,41 +501,50 @@ _claude_branches() {
 
 EOF
 
-    # One _claude_opts_<path> function per command path.
+    all_paths=$(spec_paths "$spec")
+    # Membership set for "does this child path exist", tested without forking.
+    # Command names are [a-z0-9-], so "|" can never occur inside a path.
+    local path_set='|'
+    while IFS= read -r p; do path_set="$path_set$p|"; done <<< "$all_paths"
+
     while IFS= read -r p; do
-        v=$(varname "${p:-root}")
+        v=$(varname "$p")
+
+        # Read this path's commands once; used for both the list and the dispatcher.
+        local cmd_lines
+        cmd_lines=$(awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {print $3 "\037" $4}' "$spec" |
+                    LC_ALL=C sort -u)
+        has_cmds=0
+        [ -n "$cmd_lines" ] && has_cmds=1
+
         printf '_claude_args_%s() {\n' "$v"
         printf '  local context state state_descr line curcontext=$curcontext\n'
         printf '  typeset -A opt_args\n'
         printf '  _arguments -s -C \\\n'
         # US (0x1f) as the field separator: tab is IFS whitespace, so runs of
         # tabs would collapse and shift every field after an empty one.
-        while IFS=$'\037' read -r names takes choices desc; do
+        while IFS=$'\037' read -r names takes kind vals desc; do
             for name in $names; do
                 optspec="$name"
-                [ -n "$desc" ] && optspec="$optspec[$(zsh_escape "$desc")]"
-                if [ "$takes" = 1 ]; then
-                    [ -n "$choices" ] || choices=$(curated_choices "$name")
-                    kind=$(value_kind "$name")
-                    case $kind in
-                        dir)     optspec="$optspec:directory:_files -/" ;;
-                        file)    optspec="$optspec:file:_files" ;;
-                        agent)   optspec="$optspec:agent:_claude_agents" ;;
-                        session) optspec="$optspec:session:_claude_sessions" ;;
-                        branch)  optspec="$optspec:branch:_claude_branches" ;;
-                        *)
-                            if [ -n "$choices" ]; then
-                                optspec="$optspec:value:($choices)"
-                            else
-                                optspec="$optspec:value:"
-                            fi ;;
-                    esac
-                fi
+                [ -n "$desc" ] && optspec="${optspec}[$(zsh_str "$desc")]"
+                # An action that carries arguments must begin with a space;
+                # that is how _arguments tells it from the other action forms.
+                case $kind in
+                    '')        : ;;
+                    dir)       optspec="$optspec:directory: _files -/" ;;
+                    file)      optspec="$optspec:file:_files" ;;
+                    agent)     optspec="$optspec:agent:_claude_agents" ;;
+                    session)   optspec="$optspec:session:_claude_sessions" ;;
+                    branch)    optspec="$optspec:branch:_claude_branches" ;;
+                    commalist) optspec="$optspec:value: _values -s , value $vals" ;;
+                    *)         optspec="$optspec:value:($vals)" ;;
+                esac
+                [ -z "$kind" ] && [ "$takes" = 1 ] && optspec="$optspec:value:"
                 printf "    '%s' \\\\\n" "$optspec"
             done
-        done < <(awk -F'\t' -v OFS='\037' -v p="$p" '$1=="opt" && $2==p {print $3, $4, $5, $6}' "$spec")
+        done < <(awk -F'\t' -v OFS='\037' -v p="$p" '$1=="opt" && $2==p {print $3, $4, $5, $6, $7}' "$spec")
 
-        if awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {found=1} END{exit !found}' "$spec"; then
+        if [ "$has_cmds" = 1 ]; then
             printf "    '1: :_claude_cmds_%s' \\\\\n    '*:: :->rest'\n" "$v"
             printf '  [[ $state == rest ]] && _claude_dispatch_%s\n' "$v"
         else
@@ -495,28 +552,24 @@ EOF
         fi
         printf '}\n\n'
 
-        # Command list + dispatcher for this path.
-        if awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {found=1} END{exit !found}' "$spec"; then
-            printf '_claude_cmds_%s() {\n  local -a c\n  c=(\n' "$v"
-            awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {print $3 "\037" $4}' "$spec" |
-                LC_ALL=C sort -u | while IFS=$'\037' read -r name desc; do
-                    printf "    '%s:%s'\n" "$name" "$(zsh_escape "$desc")"
-                done
-            printf '  )\n  _describe command c\n}\n\n'
+        [ "$has_cmds" = 1 ] || continue
 
-            printf '_claude_dispatch_%s() {\n  case $words[1] in\n' "$v"
-            awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {print $3}' "$spec" |
-                LC_ALL=C sort -u | while IFS= read -r name; do
-                    local child cv
-                    child=${p:+$p }$name
-                    cv=$(varname "$child")
-                    if awk -F'\t' -v c="$child" '$2==c {found=1} END{exit !found}' "$spec"; then
-                        printf '    %s) _claude_args_%s ;;\n' "$name" "$cv"
-                    fi
-                done
-            printf '    *) _default ;;\n  esac\n}\n\n'
-        fi
-    done < <(spec_paths "$spec")
+        printf '_claude_cmds_%s() {\n  local -a c\n  c=(\n' "$v"
+        printf '%s\n' "$cmd_lines" | while IFS=$'\037' read -r name desc; do
+            printf "    '%s:%s'\n" "$name" "$(zsh_str "$desc")"
+        done
+        printf '  )\n  _describe command c\n}\n\n'
+
+        printf '_claude_dispatch_%s() {\n  case $words[1] in\n' "$v"
+        printf '%s\n' "$cmd_lines" | while IFS=$'\037' read -r name desc; do
+            child=${p:+$p }$name
+            case $path_set in
+                *"|$child|"*)
+                    printf '    %s) _claude_args_%s ;;\n' "$name" "$(varname "$child")" ;;
+            esac
+        done
+        printf '    *) _default ;;\n  esac\n}\n\n'
+    done < <(printf '%s\n' "$all_paths")
 
     printf '_claude() { _claude_args_root }\n\n_claude "$@"\n'
 }
@@ -545,15 +598,12 @@ bump_version_header() {
 spec_diff_summary() {
     local old=$1 new=$2
     [ -f "$old" ] || return 0
-    local added removed
-    added=$(LC_ALL=C comm -13 \
-        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$old" | LC_ALL=C sort -u) \
-        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$new" | LC_ALL=C sort -u) |
-        awk -F'\t' '{printf "%s%s ", ($1==""?"":$1" "), $2}')
-    removed=$(LC_ALL=C comm -23 \
-        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$old" | LC_ALL=C sort -u) \
-        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$new" | LC_ALL=C sort -u) |
-        awk -F'\t' '{printf "%s%s ", ($1==""?"":$1" "), $2}')
+    local old_opts new_opts added removed
+    old_opts=$(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$old" | LC_ALL=C sort -u)
+    new_opts=$(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$new" | LC_ALL=C sort -u)
+    fmt() { awk -F'\t' '{printf "%s%s ", ($1==""?"":$1" "), $2}'; }
+    added=$(LC_ALL=C comm -13 <(printf '%s\n' "$old_opts") <(printf '%s\n' "$new_opts") | fmt)
+    removed=$(LC_ALL=C comm -23 <(printf '%s\n' "$old_opts") <(printf '%s\n' "$new_opts") | fmt)
     [ -n "$added" ]   && info "  added:   $added"
     [ -n "$removed" ] && info "  removed: $removed"
     return 0
@@ -585,10 +635,7 @@ cmd_install() {
     if [ -z "$force" ] && [ "$installed_version" = "$version" ]; then
         local missing=''
         for target in $shells; do
-            case $target in
-                bash) [ -f "$BASH_DIR/claude" ] || missing=1 ;;
-                zsh)  [ -f "$ZSH_DIR/_claude" ] || missing=1 ;;
-            esac
+            [ -f "$(shell_file "$target")" ] || missing=1
         done
         if [ -z "$missing" ]; then
             info "Up to date (claude $version)."
@@ -607,10 +654,7 @@ cmd_install() {
         # The CLI surface is byte-identical. Keep the generated scripts as they
         # are and only record the new version.
         for target in $shells; do
-            case $target in
-                bash) bump_version_header "$BASH_DIR/claude" "$version" ;;
-                zsh)  bump_version_header "$ZSH_DIR/_claude" "$version" ;;
-            esac
+            bump_version_header "$(shell_file "$target")" "$version"
         done
         write_meta "$version" "$new_hash"
         cat "$new_spec" > "$SPEC_FILE"
@@ -625,19 +669,11 @@ cmd_install() {
     fi
 
     for target in $shells; do
-        case $target in
-            bash)
-                mkdir -p "$BASH_DIR"
-                emit_bash "$new_spec" "$version" "$new_hash" > "$BASH_DIR/claude"
-                info "Installed $BASH_DIR/claude"
-                ;;
-            zsh)
-                mkdir -p "$ZSH_DIR"
-                emit_zsh "$new_spec" "$version" "$new_hash" > "$ZSH_DIR/_claude"
-                info "Installed $ZSH_DIR/_claude"
-                ;;
-            *) die "unsupported shell: $target" ;;
-        esac
+        local out
+        out=$(shell_file "$target")
+        mkdir -p "$(dirname "$out")"
+        "emit_$target" "$new_spec" "$version" "$new_hash" > "$out"
+        info "Installed $out"
     done
 
     write_meta "$version" "$new_hash"
@@ -663,7 +699,7 @@ print_activation() {
     case " $shells " in
         *" bash "*)
             printf '  bash — add to ~/.bashrc (or ~/.bash_profile on macOS login shells):\n'
-            printf '    [ -r %s/claude ] && . %s/claude\n' "$BASH_DIR" "$BASH_DIR"
+            printf '    [ -r %s ] && . %s\n' "$(shell_file bash)" "$(shell_file bash)"
             printf '    (or install bash-completion@2, which loads that directory for you)\n'
             ;;
     esac
@@ -687,12 +723,21 @@ cmd_status() {
     printf 'claude in PATH %s\n' "${version:-not found}"
     printf 'generated for  %s\n' "$installed_version"
     printf 'spec hash      %s\n' "$installed_hash"
-    printf 'bash script    %s\n' "$([ -f "$BASH_DIR/claude" ] && echo "$BASH_DIR/claude" || echo 'not installed')"
-    printf 'zsh script     %s\n' "$([ -f "$ZSH_DIR/_claude" ] && echo "$ZSH_DIR/_claude" || echo 'not installed')"
+    printf 'bash script    %s\n' "$([ -f "$(shell_file bash)" ] && shell_file bash || echo 'not installed')"
+    printf 'zsh script     %s\n' "$([ -f "$(shell_file zsh)" ] && shell_file zsh || echo 'not installed')"
 
     if [ -n "$version" ] && [ "$version" != "$installed_version" ]; then
         printf '\nRun `claude-completions install` to check for CLI changes.\n'
     fi
+}
+
+# Machine-readable install locations, so callers never re-derive them.
+cmd_paths() {
+    printf 'BASH_DIR=%s\n' "$BASH_DIR"
+    printf 'ZSH_DIR=%s\n' "$ZSH_DIR"
+    printf 'CACHE_DIR=%s\n' "$CACHE_DIR"
+    printf 'BASH_FILE=%s\n' "$(shell_file bash)"
+    printf 'ZSH_FILE=%s\n' "$(shell_file zsh)"
 }
 
 cmd_generate() {
@@ -710,15 +755,15 @@ cmd_generate() {
     build_spec > "$spec"
     hash=$(sha256 < "$spec")
     if [ -n "$out" ]; then
-        emit_"$shell" "$spec" "$version" "$hash" > "$out"
+        "emit_$shell" "$spec" "$version" "$hash" > "$out"
     else
-        emit_"$shell" "$spec" "$version" "$hash"
+        "emit_$shell" "$spec" "$version" "$hash"
     fi
     rm -f "$spec"
 }
 
 cmd_uninstall() {
-    rm -f "$BASH_DIR/claude" "$ZSH_DIR/_claude"
+    rm -f "$(shell_file bash)" "$(shell_file zsh)"
     rm -rf "$CACHE_DIR"
     info 'Removed generated completion scripts and cache.'
     info 'Remove the activation lines from your shell rc by hand.'
@@ -731,6 +776,7 @@ claude-completions — shell completions for the Claude Code CLI
 USAGE
   claude-completions install [--shell bash|zsh] [--force] [--quiet]
   claude-completions status
+  claude-completions paths
   claude-completions generate [--shell bash|zsh] [-o FILE]
   claude-completions uninstall
 
@@ -758,6 +804,7 @@ main() {
     case $cmd in
         install|update|refresh) cmd_install "$@" ;;
         status)                 cmd_status "$@" ;;
+        paths)                  cmd_paths "$@" ;;
         generate)               cmd_generate "$@" ;;
         uninstall)              cmd_uninstall "$@" ;;
         help|-h|--help)         usage ;;
