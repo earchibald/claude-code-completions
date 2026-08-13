@@ -15,6 +15,15 @@ The Claude Code CLI ships no `completion` subcommand. This tool builds one by re
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install earchibald/tap/claude-completions
+claude-completions install
+```
+
+### From source
+
 ```sh
 git clone https://github.com/earchibald/claude-code-completions
 cd claude-code-completions
@@ -22,7 +31,21 @@ cd claude-code-completions
 ```
 
 `--rc` adds the activation lines to `~/.bashrc` (or `~/.bash_profile` on macOS) and
-`~/.zshrc`. Drop it to print the lines instead and add them yourself.
+`~/.zshrc`. Drop it to print the lines instead and add them yourself. The Homebrew
+formula does not touch your shell rc; `claude-completions install` prints the line
+to add.
+
+### Verifying a release
+
+Tags are signed, and release tarballs are built reproducibly with `git archive`.
+
+```sh
+git tag -v v1.0.0                                  # signed tag
+shasum -a 256 -c SHA256SUMS                        # published checksum
+```
+
+The Homebrew formula pins the release tarball by `sha256`, so Homebrew refuses to
+install if the file ever changes.
 
 Open a new shell, then press Tab:
 
