@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION=1.0.2
+GENERATOR_VERSION=1.0.3
 CLAUDE_BIN=${CLAUDE_BIN:-claude}
 
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/claude-completions
@@ -92,13 +92,27 @@ if command -v timeout >/dev/null 2>&1; then TIMEOUT='timeout 30'
 elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT='gtimeout 30'
 fi
 
+# run_claude <args...> — every call into Claude goes through here.
+#
+# The </dev/null is load-bearing, not tidiness. `timeout` runs its child in a
+# new process group, so from an interactive shell Claude ends up in a background
+# process group that still holds the terminal on stdin. Its first read raises
+# SIGTTIN, the kernel stops the process, and the kill lands 30s later having
+# printed nothing -- which this tool used to report as a broken --help parser.
+# Nothing to read from means nothing to be stopped for.
+run_claude() {
+    # shellcheck disable=SC2086
+    $TIMEOUT "$@" </dev/null
+}
+
 claude_version() {
-    $CLAUDE_BIN --version 2>/dev/null | awk '{print $1; exit}'
+    # shellcheck disable=SC2086
+    run_claude $CLAUDE_BIN --version 2>/dev/null | awk '{print $1; exit}'
 }
 
 run_help() {
     # shellcheck disable=SC2086
-    $TIMEOUT $CLAUDE_BIN "$@" --help 2>/dev/null || true
+    run_claude $CLAUDE_BIN "$@" --help 2>/dev/null || true
 }
 
 meta_get() {
@@ -216,11 +230,18 @@ BEGIN { FS = "\t"; OFS = "\t" }
 
 # The curated table arrives as the first input file. Its rows are pipe-
 # separated, so they never look like a spec record.
-FNR == NR {
+# Guard the file-one test: were the curated table empty, FNR == NR would never
+# stop being true and every spec record would be swallowed here in silence.
+FNR == NR && FILENAME == ARGV[1] {
     if ($0 == "") next
     split($0, c, "|")
     kind[c[1]] = c[2]; vals[c[1]] = c[3]
+    seen = 1
     next
+}
+FNR == 1 && FILENAME != ARGV[1] && !seen {
+    print "claude-completions: internal: curated table came back empty" > "/dev/stderr"
+    exit 1
 }
 $1 != "opt" { print; next }
 {
@@ -241,7 +262,13 @@ AWK
 scrape() {
     local path="$*" help records
     help=$(run_help $path)
-    [ -n "$help" ] || return 0
+    # A blank subcommand page just means nothing to add. A blank root page means
+    # Claude never answered, and every later message would be a guess about why.
+    if [ -z "$help" ]; then
+        [ -n "$path" ] && return 0
+        die "\`$CLAUDE_BIN --help\` produced no output${TIMEOUT:+ within ${TIMEOUT##* }s}.
+       Run it yourself to see the error. Set CLAUDE_BIN to point at another binary."
+    fi
 
     records=$(printf '%s\n' "$help" | awk -v path="$path" "$PARSE_AWK")
     printf '%s\n' "$records"
@@ -624,7 +651,7 @@ cmd_install() {
 
     command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "'$CLAUDE_BIN' not found in PATH"
 
-    local version installed_version installed_hash installed_gen same_gen=''
+    local version installed_version installed_hash installed_gen same_gen='' missing=''
     version=$(claude_version)
     [ -n "$version" ] || die "could not read '$CLAUDE_BIN --version'"
 
@@ -636,16 +663,18 @@ cmd_install() {
     # upgrade of this tool has to regenerate even when Claude has not moved.
     [ "$installed_gen" = "$GENERATOR_VERSION" ] && same_gen=1
 
+    # Both shortcuts below leave the scripts alone, so neither may be taken while
+    # one is absent. That happens whenever a target directory changes or a file
+    # is deleted, and the recorded state still describes the previous install.
+    for target in $shells; do
+        [ -f "$(shell_file "$target")" ] || missing=1
+    done
+
     # Fast path: nothing moved and every target file is still present.
-    if [ -z "$force" ] && [ -n "$same_gen" ] && [ "$installed_version" = "$version" ]; then
-        local missing=''
-        for target in $shells; do
-            [ -f "$(shell_file "$target")" ] || missing=1
-        done
-        if [ -z "$missing" ]; then
-            info "Up to date (claude $version)."
-            return 0
-        fi
+    if [ -z "$force" ] && [ -z "$missing" ] && [ -n "$same_gen" ] &&
+       [ "$installed_version" = "$version" ]; then
+        info "Up to date (claude $version)."
+        return 0
     fi
 
     [ -n "$same_gen" ] || [ -z "$installed_gen" ] ||
@@ -658,7 +687,7 @@ cmd_install() {
     [ -s "$new_spec" ] || { rm -f "$new_spec"; die 'failed to parse any options from --help'; }
     new_hash=$(sha256 < "$new_spec")
 
-    if [ -z "$force" ] && [ -n "$same_gen" ] &&
+    if [ -z "$force" ] && [ -z "$missing" ] && [ -n "$same_gen" ] &&
        [ "$new_hash" = "$installed_hash" ] && [ -n "$installed_hash" ]; then
         # The CLI surface is byte-identical. Keep the generated scripts as they
         # are and only record the new version.

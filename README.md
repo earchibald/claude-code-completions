@@ -152,6 +152,11 @@ you, so tapped users get it without any rc change.
 ## How it works
 
 1. Run `claude --help`, then `claude <cmd> --help` for each command, to depth three.
+   Each call reads stdin from `/dev/null`. The 30-second `timeout` guard runs
+   Claude in a new process group, so from an interactive shell it would sit in a
+   background process group still holding the terminal on stdin; its first read
+   would raise `SIGTTIN`, the kernel would stop it, and the kill would arrive
+   with no output. Nothing to read from means nothing to be stopped for.
 2. Parse each page into a flat spec: options, whether each takes a value, its allowed
    values, and its description. Help text wraps across lines, so each entry is
    reflowed before it is parsed.

@@ -185,10 +185,56 @@ fi
 
 check 'rejects an unknown shell' 'unsupported shell' "$("$TOOL" completions fish 2>&1 || true)"
 
+# --- a missing script is always rewritten -------------------------------------
+#
+# Both shortcuts in cmd_install leave the generated scripts alone. Neither may
+# fire when one is absent, or the tool reports success having installed nothing.
+# The recorded state still describes the last install, so nothing else changes:
+# only the target directory moves.
+
+echo 'missing scripts'
+out=$(CLAUDE_COMPLETIONS_BASH_DIR=$WORK/fresh FAKE_VERSION=1.3.0 "$TOOL" install --shell bash 2>&1)
+[ -f "$WORK/fresh/claude" ] && ok 'fresh directory gets a script' \
+                            || bad 'fresh directory gets a script' "$out"
+
+rm -f "$WORK/bash/claude"
+out=$(FAKE_VERSION=1.3.0 "$TOOL" install --shell bash 2>&1)
+[ -f "$WORK/bash/claude" ] && ok 'a deleted script is restored' \
+                           || bad 'a deleted script is restored' "$out"
+
+# --- claude never inherits our stdin ------------------------------------------
+#
+# `timeout` puts Claude in a background process group. If it could still see the
+# caller's terminal on stdin, its first read would raise SIGTTIN, the kernel
+# would stop it, and the 30s kill would leave us with an empty help page --
+# reported, misleadingly, as "failed to parse any options from --help".
+#
+# A terminal cannot be conjured here, but the fix itself can be tested exactly:
+# Claude must see EOF, never a byte the caller was holding on stdin.
+
+echo 'stdin isolation'
+cat > "$WORK/bin/claude-stdin" <<'FEOF'
+#!/usr/bin/env bash
+# Anything readable here means our stdin was inherited rather than redirected.
+if [ -n "$(cat)" ]; then echo 'STDIN LEAKED' >&2; exit 1; fi
+if [ "$1" = "--version" ]; then echo "${FAKE_VERSION:-9.9.9} (Claude Code)"; exit 0; fi
+"$REAL_CLAUDE" "$@" 2>/dev/null
+FEOF
+chmod +x "$WORK/bin/claude-stdin"
+
+out=$(printf 'DO NOT READ ME\n' |
+      CLAUDE_BIN=$WORK/bin/claude-stdin FAKE_VERSION=2.0.0 "$TOOL" install --force 2>&1)
+check 'claude sees EOF, not our stdin' 'Installed' "$out"
+case "$out" in
+    *'STDIN LEAKED'*|*'failed to parse'*) bad 'stdin is not inherited' "$out" ;;
+    *) ok 'stdin is not inherited' ;;
+esac
+check 'and the spec is still complete' '--effort' "$(comp claude --eff)"
+
 # --- housekeeping ------------------------------------------------------------
 
 echo 'housekeeping'
-check 'status reports version' '1.3.0' "$("$TOOL" status 2>&1)"
+check 'status reports version' '2.0.0' "$("$TOOL" status 2>&1)"
 "$TOOL" uninstall >/dev/null 2>&1
 [ -f "$WORK/bash/claude" ] && bad 'uninstall removes scripts' || ok 'uninstall removes scripts'
 
