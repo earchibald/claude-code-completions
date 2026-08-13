@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-GENERATOR_VERSION=1.0.1
+GENERATOR_VERSION=1.0.2
 CLAUDE_BIN=${CLAUDE_BIN:-claude}
 
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/claude-completions
@@ -624,15 +624,20 @@ cmd_install() {
 
     command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "'$CLAUDE_BIN' not found in PATH"
 
-    local version installed_version installed_hash
+    local version installed_version installed_hash installed_gen same_gen=''
     version=$(claude_version)
     [ -n "$version" ] || die "could not read '$CLAUDE_BIN --version'"
 
     installed_version=$(meta_get claude-version || echo '')
     installed_hash=$(meta_get spec-hash || echo '')
+    installed_gen=$(meta_get generator-version || echo '')
 
-    # Fast path: same Claude version and every target file still present.
-    if [ -z "$force" ] && [ "$installed_version" = "$version" ]; then
+    # A newer generator can emit different scripts from the same spec, so an
+    # upgrade of this tool has to regenerate even when Claude has not moved.
+    [ "$installed_gen" = "$GENERATOR_VERSION" ] && same_gen=1
+
+    # Fast path: nothing moved and every target file is still present.
+    if [ -z "$force" ] && [ -n "$same_gen" ] && [ "$installed_version" = "$version" ]; then
         local missing=''
         for target in $shells; do
             [ -f "$(shell_file "$target")" ] || missing=1
@@ -643,6 +648,9 @@ cmd_install() {
         fi
     fi
 
+    [ -n "$same_gen" ] || [ -z "$installed_gen" ] ||
+        info "claude-completions $installed_gen -> $GENERATOR_VERSION: regenerating."
+
     info "Reading the CLI surface of claude $version ..."
     local new_spec new_hash
     new_spec=$(mktemp)
@@ -650,7 +658,8 @@ cmd_install() {
     [ -s "$new_spec" ] || { rm -f "$new_spec"; die 'failed to parse any options from --help'; }
     new_hash=$(sha256 < "$new_spec")
 
-    if [ -z "$force" ] && [ "$new_hash" = "$installed_hash" ] && [ -n "$installed_hash" ]; then
+    if [ -z "$force" ] && [ -n "$same_gen" ] &&
+       [ "$new_hash" = "$installed_hash" ] && [ -n "$installed_hash" ]; then
         # The CLI surface is byte-identical. Keep the generated scripts as they
         # are and only record the new version.
         for target in $shells; do
@@ -731,6 +740,97 @@ cmd_status() {
     fi
 }
 
+# Completion for this tool itself. Source it:
+#     . <(claude-completions completions bash)
+#     . <(claude-completions completions zsh)
+#
+# Hand-written, unlike the generated Claude completions: this CLI is small, and
+# reading its own --help to describe itself would be circular.
+cmd_completions() {
+    local shell=${1:-bash}
+    local cmds='install update refresh status paths generate completions uninstall help'
+
+    case $shell in
+        bash)
+            cat <<EOF
+_claude_completions() {
+    local cur=\${COMP_WORDS[COMP_CWORD]} prev=\${COMP_WORDS[COMP_CWORD-1]} cmd=''
+    local i
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        case \${COMP_WORDS[i]} in -*) ;; *) cmd=\${COMP_WORDS[i]}; break ;; esac
+    done
+
+    case \$prev in
+        --shell) COMPREPLY=(\$(compgen -W 'bash zsh' -- "\$cur")); return ;;
+        -o|--output) COMPREPLY=(\$(compgen -f -- "\$cur")); return ;;
+    esac
+
+    if [ -z "\$cmd" ]; then
+        COMPREPLY=(\$(compgen -W '$cmds' -- "\$cur"))
+        return
+    fi
+
+    case \$cmd in
+        install|update|refresh)
+            COMPREPLY=(\$(compgen -W '--shell --force --quiet' -- "\$cur")) ;;
+        generate)
+            COMPREPLY=(\$(compgen -W '--shell --output' -- "\$cur")) ;;
+        completions)
+            COMPREPLY=(\$(compgen -W 'bash zsh' -- "\$cur")) ;;
+        *)  COMPREPLY=() ;;
+    esac
+}
+complete -F _claude_completions claude-completions
+EOF
+            ;;
+        zsh)
+            cat <<'EOF'
+#compdef claude-completions
+_claude_completions() {
+  local context state state_descr line curcontext=$curcontext
+  typeset -A opt_args
+  local -a cmds
+  cmds=(
+    'install:generate and install the completion scripts'
+    'update:alias for install'
+    'refresh:alias for install'
+    'status:show versions and installed paths'
+    'paths:print install locations, machine-readable'
+    'generate:write a completion script to stdout'
+    'completions:completion for this tool itself'
+    'uninstall:remove generated scripts and cache'
+    'help:show usage'
+  )
+  _arguments -s -C '1: :->cmd' '*:: :->args'
+  case $state in
+    cmd) _describe command cmds ;;
+    args)
+      case $words[1] in
+        install|update|refresh)
+          _arguments '--shell[shell to install for]:shell:(bash zsh)' \
+                     '--force[regenerate even if nothing changed]' \
+                     '(-q --quiet)'{-q,--quiet}'[suppress output]' ;;
+        generate)
+          _arguments '--shell[shell to generate for]:shell:(bash zsh)' \
+                     '(-o --output)'{-o,--output}'[write to a file]:file:_files' ;;
+        completions) _arguments '1:shell:(bash zsh)' ;;
+        *) _default ;;
+      esac ;;
+  esac
+}
+
+# Works both autoloaded from fpath and sourced directly.
+if [[ $zsh_eval_context[-1] == loadautofunc ]]; then
+  _claude_completions "$@"
+else
+  compdef _claude_completions claude-completions
+fi
+EOF
+            ;;
+        *) die "unsupported shell: $shell (use bash or zsh)" ;;
+    esac
+}
+
 # Machine-readable install locations, so callers never re-derive them.
 cmd_paths() {
     printf 'BASH_DIR=%s\n' "$BASH_DIR"
@@ -777,11 +877,17 @@ USAGE
   claude-completions install [--shell bash|zsh] [--force] [--quiet]
   claude-completions status
   claude-completions paths
+  claude-completions completions [bash|zsh]
   claude-completions generate [--shell bash|zsh] [-o FILE]
   claude-completions uninstall
 
 The completion scripts are generated from `claude --help`, so they match the
 Claude Code version you have installed.
+
+Completion for this tool itself:
+
+  . <(claude-completions completions bash)
+  . <(claude-completions completions zsh)
 
 `install` is also the update path, and it is version-aware:
 
@@ -790,6 +896,9 @@ Claude Code version you have installed.
                                              leaving the scripts byte-identical.
   * New version, changed CLI surface      -> regenerates and reports which
                                              options were added or removed.
+
+Upgrading claude-completions itself also forces a regenerate, since a newer
+generator can emit different scripts from the same spec.
 
 ENVIRONMENT
   CLAUDE_BIN                    path to the claude binary (default: claude)
@@ -805,6 +914,7 @@ main() {
         install|update|refresh) cmd_install "$@" ;;
         status)                 cmd_status "$@" ;;
         paths)                  cmd_paths "$@" ;;
+        completions)            cmd_completions "$@" ;;
         generate)               cmd_generate "$@" ;;
         uninstall)              cmd_uninstall "$@" ;;
         help|-h|--help)         usage ;;

@@ -84,6 +84,7 @@ path as well as the install path, and it does the least work that is correct:
 | Same Claude version as last run | Nothing. Exits immediately. |
 | New version, identical CLI surface | Records the new version. The completion scripts stay byte-identical. |
 | New version, changed CLI surface | Regenerates, and reports which options were added or removed. |
+| `claude-completions` itself upgraded | Regenerates, because a newer generator can emit different scripts from the same spec. |
 
 The second row is the point of the design. Most Claude Code releases change no flags,
 so a version bump alone must not churn your files. The tool hashes the parsed command
@@ -116,12 +117,29 @@ Each generated script records its provenance in its header:
 ```
 claude-completions install [--shell bash|zsh] [--force] [--quiet]
 claude-completions status
+claude-completions paths
 claude-completions generate [--shell bash|zsh] [-o FILE]
+claude-completions completions [bash|zsh]
 claude-completions uninstall
 ```
 
-`generate` writes a script to stdout without installing it. Use it to inspect the
-output or to vendor a completion file into another repo.
+`generate` writes a `claude` completion script to stdout without installing it.
+Use it to inspect the output or to vendor a completion file into another repo.
+
+`paths` prints the install locations in `KEY=value` form, so scripts never have to
+re-derive them.
+
+## Completing this tool itself
+
+`completions` prints a completion script for `claude-completions`. Source it:
+
+```sh
+. <(claude-completions completions bash)
+. <(claude-completions completions zsh)
+```
+
+Add that line to your shell rc to keep it. The Homebrew formula installs it for
+you, so tapped users get it without any rc change.
 
 ## Environment
 

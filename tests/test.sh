@@ -131,6 +131,60 @@ check 'new flag completes'         '--zzz-test-flag'     "$(comp claude --zzz)"
 out=$(FAKE_VERSION=1.3.0 "$TOOL" install 2>&1)
 check 'removed flags are reported' 'removed:' "$out"
 
+# A newer generator must regenerate even when Claude has not moved, because it
+# can emit different scripts from the same spec.
+sed -i.bak 's/^generator-version=.*/generator-version=0.0.1/' "$XDG_CACHE_HOME/claude-completions/meta"
+out=$(FAKE_VERSION=1.3.0 "$TOOL" install 2>&1)
+check 'generator upgrade forces regenerate' '0.0.1 ->' "$out"
+check 'generator upgrade rewrites scripts'  'Installed' "$out"
+out=$(FAKE_VERSION=1.3.0 "$TOOL" install 2>&1)
+check 'and then settles'                    'Up to date' "$out"
+
+# --- self-completion ---------------------------------------------------------
+
+echo 'completions subcommand'
+selfb=$("$TOOL" completions bash)
+check 'bash: registers a completion' 'complete -F _claude_completions claude-completions' "$selfb"
+check 'bash: knows its subcommands'  'install update refresh status paths generate' "$selfb"
+
+# It has to survive being sourced, which is the documented usage.
+sc=$(bash -c '
+  . <(cat) 2>/dev/null || exit 3
+  declare -F _claude_completions >/dev/null || exit 4
+  comp() {
+    COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 ))
+    COMPREPLY=(); _claude_completions 2>/dev/null; printf "%s\n" "${COMPREPLY[*]}"
+  }
+  echo "CMDS:$(comp claude-completions "")"
+  echo "SHELL:$(comp claude-completions install --shell "")"
+  echo "SUB:$(comp claude-completions completions "")"
+  echo "FLAGS:$(comp claude-completions install --)"
+' <<<"$selfb")
+check 'bash: sourcing defines the function' 'CMDS:' "$sc"
+check 'bash: completes subcommands'         'uninstall' "$sc"
+check 'bash: completes --shell values'      'SHELL:bash zsh' "$sc"
+check 'bash: completes completions arg'     'SUB:bash zsh' "$sc"
+check 'bash: completes install flags'       '--force' "$sc"
+
+if command -v zsh >/dev/null 2>&1; then
+    selfz=$("$TOOL" completions zsh)
+    printf '%s\n' "$selfz" > "$WORK/_selfzsh"
+    if zsh -n "$WORK/_selfzsh" 2>/dev/null; then ok 'zsh: self-completion parses'; else bad 'zsh: self-completion parses'; fi
+    # Sourced (not autoloaded) it must register itself via compdef.
+    zout=$(zsh -c '
+      autoload -Uz compinit && compinit -u -d '"$WORK"'/zcd2 >/dev/null 2>&1
+      . '"$WORK"'/_selfzsh
+      (( $+functions[_claude_completions] )) && print DEFINED
+      print "REGISTERED:${_comps[claude-completions]:-NONE}"
+    ' 2>&1)
+    check 'zsh: sourcing defines the function' 'DEFINED' "$zout"
+    check 'zsh: sourcing registers compdef'    'REGISTERED:_claude_completions' "$zout"
+else
+    echo '  skip zsh self-completion (zsh not installed)'
+fi
+
+check 'rejects an unknown shell' 'unsupported shell' "$("$TOOL" completions fish 2>&1 || true)"
+
 # --- housekeeping ------------------------------------------------------------
 
 echo 'housekeeping'
