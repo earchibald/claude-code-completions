@@ -1,0 +1,769 @@
+#!/usr/bin/env bash
+# claude-completions — generate and install shell completions for the Claude Code CLI.
+#
+# The completion scripts are derived from `claude --help`, so they track whatever
+# version of Claude Code you actually have installed.
+#
+# https://github.com/earchibald/claude-code-completions
+
+set -euo pipefail
+
+GENERATOR_VERSION=1.0.0
+CLAUDE_BIN=${CLAUDE_BIN:-claude}
+
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/claude-completions
+DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}
+BASH_DIR=${CLAUDE_COMPLETIONS_BASH_DIR:-$DATA_DIR/bash-completion/completions}
+ZSH_DIR=${CLAUDE_COMPLETIONS_ZSH_DIR:-$DATA_DIR/zsh/site-functions}
+
+SPEC_FILE=$CACHE_DIR/spec.tsv
+META_FILE=$CACHE_DIR/meta
+
+# ---------------------------------------------------------------------------
+# Curated tables
+#
+# `claude --help` exposes some enums machine-readably as `(choices: "a", "b")`.
+# The rest live here. Edit these when the CLI grows a value the parser cannot
+# see; everything else is discovered automatically.
+# ---------------------------------------------------------------------------
+
+curated_choices() {
+    case $1 in
+        --model|--fallback-model)
+            echo 'fable opus sonnet haiku claude-fable-5 claude-opus-5 claude-sonnet-5 claude-haiku-4-5-20251001' ;;
+        --effort)          echo 'low medium high xhigh max' ;;
+        --setting-sources) echo 'user project local' ;;
+        --scope)           echo 'local user project' ;;
+        --transport)       echo 'stdio sse http' ;;
+        --tools|--allowed-tools|--allowedTools|--disallowed-tools|--disallowedTools)
+            echo 'Bash Edit Glob Grep Read Write WebFetch WebSearch NotebookEdit Task TodoWrite' ;;
+        --debug)           echo 'api hooks mcp file statsig' ;;
+        *)                 echo '' ;;
+    esac
+}
+
+# Options whose value is a comma-separated list of the choices above.
+is_comma_list() {
+    case $1 in
+        --setting-sources|--tools|--allowed-tools|--allowedTools|\
+        --disallowed-tools|--disallowedTools) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Options whose value is a path.
+value_kind() {
+    case $1 in
+        --add-dir|--plugin-dir|--cwd) echo dir ;;
+        --settings|--file|--mcp-config|--json-schema|--debug-file|\
+        --system-prompt|--append-system-prompt|--system-prompt-file|\
+        --append-system-prompt-file) echo file ;;
+        --agent)    echo agent ;;
+        --resume|-r) echo session ;;
+        --worktree|-w) echo branch ;;
+        *) echo '' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() { printf 'claude-completions: %s\n' "$*" >&2; exit 1; }
+info() { [ -n "${QUIET:-}" ] || printf '%s\n' "$*"; }
+
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+    else die 'need sha256sum or shasum'
+    fi
+}
+
+TIMEOUT=''
+if command -v timeout >/dev/null 2>&1; then TIMEOUT='timeout 30'
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT='gtimeout 30'
+fi
+
+claude_version() {
+    $CLAUDE_BIN --version 2>/dev/null | awk '{print $1; exit}'
+}
+
+run_help() {
+    # shellcheck disable=SC2086
+    $TIMEOUT $CLAUDE_BIN "$@" --help 2>/dev/null || true
+}
+
+meta_get() {
+    [ -f "$META_FILE" ] || return 1
+    awk -F= -v k="$1" '$1==k {print substr($0, length(k)+2); found=1} END{exit !found}' "$META_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Help parser
+# ---------------------------------------------------------------------------
+
+read -r -d '' PARSE_AWK <<'AWK' || true
+# Emits TSV records for one help page.
+#   opt <TAB> path <TAB> names <TAB> takesvalue <TAB> choices <TAB> description
+#   cmd <TAB> path <TAB> name  <TAB> description
+BEGIN { mode = "" }
+
+/^Options:/  { flush(); mode = "opt"; next }
+/^Commands:/ { flush(); mode = "cmd"; next }
+/^[A-Z][A-Za-z ]*:/ { flush(); mode = ""; next }
+/^$/ { next }
+
+mode == "opt" {
+    if ($0 ~ /^  -[^ ]/) { flush(); first = $0; full = $0 }
+    else if (first != "") { l = $0; sub(/^ +/, "", l); full = full " " l }
+    next
+}
+mode == "cmd" {
+    # A command entry sits at exactly two spaces and its first token is a bare
+    # command name. Prose such as an indented "Examples:" block also sits at two
+    # spaces, so the name shape is what separates them.
+    if ($0 ~ /^  [a-z][a-z0-9|-]*([ ]|$)/) { flush(); first = $0; full = $0 }
+    else if (first != "") { l = $0; sub(/^ +/, "", l); full = full " " l }
+    next
+}
+END { flush() }
+
+function clean(s) {
+    gsub(/  +/, " ", s); sub(/^ +/, "", s); sub(/ +$/, "", s)
+    gsub(/\t/, " ", s)
+    return s
+}
+
+function flush(   sig, names, n, takes, choices, desc, tmp, m, cname) {
+    if (first == "") return
+
+    if (mode == "opt") {
+        sig = first; sub(/^ +/, "", sig)
+        names = ""
+        while (match(sig, /^--?[A-Za-z0-9][A-Za-z0-9-]*/)) {
+            n = substr(sig, RSTART, RLENGTH)
+            names = (names == "" ? n : names " " n)
+            sig = substr(sig, RSTART + RLENGTH)
+            if (sig ~ /^, /) sig = substr(sig, 3); else break
+        }
+        takes = (sig ~ /^ *[<[]/) ? 1 : 0
+
+        choices = ""
+        if (match(full, /\(choices: [^)]*\)/)) {
+            tmp = substr(full, RSTART, RLENGTH)
+            while (match(tmp, /"[^"]*"/)) {
+                m = substr(tmp, RSTART + 1, RLENGTH - 2)
+                choices = (choices == "" ? m : choices " " m)
+                tmp = substr(tmp, RSTART + RLENGTH)
+            }
+        }
+
+        desc = full; sub(/^ +/, "", desc)
+        sub(/^--?[A-Za-z0-9][A-Za-z0-9-]*(, --?[A-Za-z0-9][A-Za-z0-9-]*)*( *[<[][^]>]*[]>])?/, "", desc)
+        sub(/ *\(choices:.*/, "", desc)
+        desc = clean(desc)
+
+        printf "opt\t%s\t%s\t%d\t%s\t%s\n", path, names, takes, choices, desc
+    } else if (mode == "cmd") {
+        desc = full; sub(/^ +/, "", desc)
+        cname = desc
+        sub(/ .*/, "", cname)
+        sub(/^[^ ]+/, "", desc)
+        sub(/^ *(\[options\])?*/, "", desc)
+        sub(/^ *(\[[^]]*\] *)*/, "", desc)
+        sub(/^ *(<[^>]*> *)*/, "", desc)
+        desc = clean(desc)
+        # Command help often runs into a long Examples block; keep one sentence.
+        if (match(desc, /\. /)) desc = substr(desc, 1, RSTART)
+        if (length(desc) > 100) desc = substr(desc, 1, 100)
+        desc = clean(desc)
+        if (cname ~ /^[a-z][a-z0-9|-]*$/ && cname != "help")
+            printf "cmd\t%s\t%s\t%s\n", path, cname, desc
+    }
+    first = ""; full = ""
+}
+AWK
+
+# scrape <path...> — recursively walk the command tree.
+scrape() {
+    local path="$*"
+    local help
+    help=$(run_help $path)
+    [ -n "$help" ] || return 0
+
+    printf '%s\n' "$help" | awk -v path="$path" "$PARSE_AWK"
+
+    # Recurse only into the primary name of each command (aliases share it).
+    local depth=$#
+    [ "$depth" -ge 3 ] && return 0
+
+    local names name
+    names=$(printf '%s\n' "$help" | awk -v path="$path" "$PARSE_AWK" |
+            awk -F'\t' -v p="$path" '$1=="cmd" && $2==p {print $3}')
+    for name in $names; do
+        name=${name%%|*}
+        case $name in
+            help|serve|gateway) continue ;;   # no useful children / may block
+        esac
+        scrape $path "$name"
+    done
+}
+
+build_spec() {
+    mkdir -p "$CACHE_DIR"
+    local tmp
+    tmp=$(mktemp)
+    scrape > "$tmp"
+    # Alias names are recorded as separate commands so they complete too.
+    LC_ALL=C sort -u "$tmp" | awk -F'\t' -v OFS='\t' '
+        $1=="cmd" && $3 ~ /\|/ {
+            n = split($3, a, "|")
+            for (i = 1; i <= n; i++) { $3 = a[i]; print }
+            next
+        }
+        { print }
+    ' | LC_ALL=C sort -u
+    rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Emitters
+# ---------------------------------------------------------------------------
+
+varname() {
+    printf '%s' "$1" | tr ' -' '__' | tr -cd 'A-Za-z0-9_'
+}
+
+spec_paths() {
+    awk -F'\t' '{print $2}' "$1" | LC_ALL=C sort -u
+}
+
+# Every option name in the spec that takes a value, plus its choices.
+emit_choices_case() {
+    local spec=$1 name choices kind
+    local seen=' '
+    while IFS= read -r name; do
+        case $seen in *" $name "*) continue ;; esac
+        seen="$seen$name "
+        choices=$(awk -F'\t' -v n="$name" '$1=="opt" {
+            split($3, a, " ")
+            for (i in a) if (a[i]==n && $5!="") { print $5; exit }
+        }' "$spec")
+        [ -n "$choices" ] || choices=$(curated_choices "$name")
+        kind=$(value_kind "$name")
+        [ -n "$choices" ] || [ -n "$kind" ] || continue
+        printf '        %s) __kind=%s; __vals=%s ;;\n' \
+            "$name" "${kind:-list}" "$(printf '%q' "$choices")"
+    done < <(awk -F'\t' '$1=="opt" && $4==1 {split($3,a," "); for (i in a) print a[i]}' "$spec")
+}
+
+emit_bash() {
+    local spec=$1 version=$2 hash=$3
+    local p v
+
+    cat <<EOF
+# bash completion for the Claude Code CLI — GENERATED, do not edit by hand.
+# Regenerate with: claude-completions install
+#
+# generator-version: $GENERATOR_VERSION
+# claude-version: $version
+# spec-hash: $hash
+
+EOF
+
+    while IFS= read -r p; do
+        v=$(varname "${p:-root}")
+        printf '_claude_cmds_%s=%s\n' "$v" \
+            "$(printf '%q' "$(awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {print $3}' "$spec" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//')")"
+        printf '_claude_opts_%s=%s\n' "$v" \
+            "$(printf '%q' "$(awk -F'\t' -v p="$p" '$1=="opt" && $2==p {split($3,a," "); for (i in a) print a[i]}' "$spec" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//')")"
+        printf '_claude_valopts_%s=%s\n' "$v" \
+            "$(printf '%q' "$(awk -F'\t' -v p="$p" '$1=="opt" && $2==p && $4==1 {split($3,a," "); for (i in a) print a[i]}' "$spec" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//')")"
+    done < <(spec_paths "$spec")
+
+    cat <<'EOF'
+
+# --- dynamic value sources --------------------------------------------------
+
+_claude_agent_names() {
+    local dir
+    for dir in ./.claude/agents "$HOME/.claude/agents"; do
+        [ -d "$dir" ] || continue
+        find "$dir" -maxdepth 2 -name '*.md' 2>/dev/null |
+            sed -e 's|.*/||' -e 's|\.md$||'
+    done
+}
+
+_claude_session_ids() {
+    local slug=${PWD//\//-}
+    slug=${slug//./-}
+    local dir="$HOME/.claude/projects/$slug"
+    [ -d "$dir" ] || return 0
+    ls -t "$dir"/*.jsonl 2>/dev/null | head -20 |
+        sed -e 's|.*/||' -e 's|\.jsonl$||'
+}
+
+_claude_branches() { git branch --format='%(refname:short)' 2>/dev/null; }
+
+_claude_comma_list() {
+    local values=$1 cur=$2 prefix=${2%,*} last=${2##*,}
+    if [[ $cur == *,* ]]; then
+        COMPREPLY=($(compgen -W "$values" -- "$last"))
+        COMPREPLY=("${COMPREPLY[@]/#/$prefix,}")
+    else
+        COMPREPLY=($(compgen -W "$values" -- "$cur"))
+    fi
+}
+
+# Produce completions for the value of option $1. Returns 1 if $1 takes none.
+_claude_value() {
+    local __opt=$1 __cur=$2 __kind='' __vals=''
+    case $__opt in
+EOF
+    emit_choices_case "$spec"
+    cat <<'EOF'
+        *) return 1 ;;
+    esac
+
+    case $__kind in
+        dir)     COMPREPLY=($(compgen -d -- "$__cur")); compopt -o filenames 2>/dev/null ;;
+        file)    COMPREPLY=($(compgen -f -- "$__cur")); compopt -o filenames 2>/dev/null ;;
+        agent)   COMPREPLY=($(compgen -W "$(_claude_agent_names)" -- "$__cur")) ;;
+        session) COMPREPLY=($(compgen -W "$(_claude_session_ids)" -- "$__cur")) ;;
+        branch)  COMPREPLY=($(compgen -W "$(_claude_branches)" -- "$__cur")) ;;
+        *)
+            case $__opt in
+EOF
+    awk -F'\t' '$1=="opt" && $4==1 {split($3,a," "); for (i in a) print a[i]}' "$spec" |
+        LC_ALL=C sort -u | while IFS= read -r n; do
+            if is_comma_list "$n"; then printf '                %s) _claude_comma_list "$__vals" "$__cur"; return 0 ;;\n' "$n"; fi
+        done
+    cat <<'EOF'
+            esac
+            COMPREPLY=($(compgen -W "$__vals" -- "$__cur"))
+            ;;
+    esac
+    return 0
+}
+
+# --- main -------------------------------------------------------------------
+
+_claude() {
+    local cur prev words cword
+    if declare -F _init_completion >/dev/null; then
+        _init_completion -n : || return
+    else
+        COMPREPLY=()
+        cur=${COMP_WORDS[COMP_CWORD]}
+        prev=${COMP_WORDS[COMP_CWORD-1]}
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    fi
+
+    # Walk the words to find the deepest command path, skipping option values.
+    local i w path='' next_path vcmds vopts vval skip=0
+    for ((i = 1; i < cword; i++)); do
+        w=${words[i]}
+        if ((skip)); then skip=0; continue; fi
+        if [[ $w == -* ]]; then
+            vval=_claude_valopts_$(_claude_var "$path")
+            case " ${!vval-} " in *" $w "*) skip=1 ;; esac
+            continue
+        fi
+        next_path=${path:+$path }$w
+        vcmds=_claude_cmds_$(_claude_var "$next_path")
+        vopts=_claude_opts_$(_claude_var "$next_path")
+        if [[ -n ${!vcmds-} || -n ${!vopts-} ]]; then path=$next_path; fi
+    done
+
+    if [[ $prev == -* ]] && _claude_value "$prev" "$cur"; then return; fi
+
+    vcmds=_claude_cmds_$(_claude_var "$path")
+    vopts=_claude_opts_$(_claude_var "$path")
+
+    if [[ $cur == -* ]]; then
+        COMPREPLY=($(compgen -W "${!vopts-}" -- "$cur"))
+    else
+        COMPREPLY=($(compgen -W "${!vcmds-}" -- "$cur"))
+    fi
+}
+
+_claude_var() {
+    local s=${1:-root}
+    s=${s// /_}
+    s=${s//-/_}
+    printf '%s' "$s"
+}
+
+complete -F _claude claude
+EOF
+}
+
+# _arguments specs are delimited by [ ] : ( ) and quoted with ' — strip every
+# one of them rather than trying to escape, and keep descriptions short.
+zsh_escape() {
+    printf '%s' "$1" |
+        tr -d '`\\"'"'" |
+        tr '[]():' '     ' |
+        tr -s ' ' |
+        cut -c1-70 |
+        sed 's/ *$//'
+}
+
+emit_zsh() {
+    local spec=$1 version=$2 hash=$3
+    local p v names name desc takes choices kind optspec
+
+    cat <<EOF
+#compdef claude
+# zsh completion for the Claude Code CLI — GENERATED, do not edit by hand.
+# Regenerate with: claude-completions install
+#
+# generator-version: $GENERATOR_VERSION
+# claude-version: $version
+# spec-hash: $hash
+
+EOF
+
+    cat <<'EOF'
+_claude_agents() {
+    local -a n
+    local dir
+    for dir in ./.claude/agents "$HOME/.claude/agents"; do
+        [[ -d $dir ]] || continue
+        n+=(${${(f)"$(find $dir -maxdepth 2 -name '*.md' 2>/dev/null)"}:t:r})
+    done
+    _describe 'agent' n
+}
+
+_claude_sessions() {
+    local slug=${${PWD//\//-}//./-}
+    local dir="$HOME/.claude/projects/$slug"
+    [[ -d $dir ]] || return
+    local -a s
+    s=(${${(f)"$(ls -t $dir/*.jsonl 2>/dev/null | head -20)"}:t:r})
+    _describe 'session' s
+}
+
+_claude_branches() {
+    local -a b
+    b=(${(f)"$(git branch --format='%(refname:short)' 2>/dev/null)"})
+    _describe 'branch' b
+}
+
+EOF
+
+    # One _claude_opts_<path> function per command path.
+    while IFS= read -r p; do
+        v=$(varname "${p:-root}")
+        printf '_claude_args_%s() {\n' "$v"
+        printf '  local context state state_descr line curcontext=$curcontext\n'
+        printf '  typeset -A opt_args\n'
+        printf '  _arguments -s -C \\\n'
+        # US (0x1f) as the field separator: tab is IFS whitespace, so runs of
+        # tabs would collapse and shift every field after an empty one.
+        while IFS=$'\037' read -r names takes choices desc; do
+            for name in $names; do
+                optspec="$name"
+                [ -n "$desc" ] && optspec="$optspec[$(zsh_escape "$desc")]"
+                if [ "$takes" = 1 ]; then
+                    [ -n "$choices" ] || choices=$(curated_choices "$name")
+                    kind=$(value_kind "$name")
+                    case $kind in
+                        dir)     optspec="$optspec:directory:_files -/" ;;
+                        file)    optspec="$optspec:file:_files" ;;
+                        agent)   optspec="$optspec:agent:_claude_agents" ;;
+                        session) optspec="$optspec:session:_claude_sessions" ;;
+                        branch)  optspec="$optspec:branch:_claude_branches" ;;
+                        *)
+                            if [ -n "$choices" ]; then
+                                optspec="$optspec:value:($choices)"
+                            else
+                                optspec="$optspec:value:"
+                            fi ;;
+                    esac
+                fi
+                printf "    '%s' \\\\\n" "$optspec"
+            done
+        done < <(awk -F'\t' -v OFS='\037' -v p="$p" '$1=="opt" && $2==p {print $3, $4, $5, $6}' "$spec")
+
+        if awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {found=1} END{exit !found}' "$spec"; then
+            printf "    '1: :_claude_cmds_%s' \\\\\n    '*:: :->rest'\n" "$v"
+            printf '  [[ $state == rest ]] && _claude_dispatch_%s\n' "$v"
+        else
+            printf "    '*: :_default'\n"
+        fi
+        printf '}\n\n'
+
+        # Command list + dispatcher for this path.
+        if awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {found=1} END{exit !found}' "$spec"; then
+            printf '_claude_cmds_%s() {\n  local -a c\n  c=(\n' "$v"
+            awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {print $3 "\037" $4}' "$spec" |
+                LC_ALL=C sort -u | while IFS=$'\037' read -r name desc; do
+                    printf "    '%s:%s'\n" "$name" "$(zsh_escape "$desc")"
+                done
+            printf '  )\n  _describe command c\n}\n\n'
+
+            printf '_claude_dispatch_%s() {\n  case $words[1] in\n' "$v"
+            awk -F'\t' -v p="$p" '$1=="cmd" && $2==p {print $3}' "$spec" |
+                LC_ALL=C sort -u | while IFS= read -r name; do
+                    local child cv
+                    child=${p:+$p }$name
+                    cv=$(varname "$child")
+                    if awk -F'\t' -v c="$child" '$2==c {found=1} END{exit !found}' "$spec"; then
+                        printf '    %s) _claude_args_%s ;;\n' "$name" "$cv"
+                    fi
+                done
+            printf '    *) _default ;;\n  esac\n}\n\n'
+        fi
+    done < <(spec_paths "$spec")
+
+    printf '_claude() { _claude_args_root }\n\n_claude "$@"\n'
+}
+
+# ---------------------------------------------------------------------------
+# Install / update
+# ---------------------------------------------------------------------------
+
+detect_shells() {
+    local found=''
+    command -v bash >/dev/null 2>&1 && found="$found bash"
+    command -v zsh  >/dev/null 2>&1 && found="$found zsh"
+    printf '%s' "${found# }"
+}
+
+# Rewrite only the `claude-version:` header line of an installed file.
+bump_version_header() {
+    local file=$1 version=$2 tmp
+    [ -f "$file" ] || return 0
+    tmp=$(mktemp)
+    sed "s|^# claude-version: .*|# claude-version: $version|" "$file" > "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+spec_diff_summary() {
+    local old=$1 new=$2
+    [ -f "$old" ] || return 0
+    local added removed
+    added=$(LC_ALL=C comm -13 \
+        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$old" | LC_ALL=C sort -u) \
+        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$new" | LC_ALL=C sort -u) |
+        awk -F'\t' '{printf "%s%s ", ($1==""?"":$1" "), $2}')
+    removed=$(LC_ALL=C comm -23 \
+        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$old" | LC_ALL=C sort -u) \
+        <(awk -F'\t' '$1=="opt"{print $2"\t"$3}' "$new" | LC_ALL=C sort -u) |
+        awk -F'\t' '{printf "%s%s ", ($1==""?"":$1" "), $2}')
+    [ -n "$added" ]   && info "  added:   $added"
+    [ -n "$removed" ] && info "  removed: $removed"
+    return 0
+}
+
+cmd_install() {
+    local shells='' force='' target
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --shell) shells="$shells $2"; shift 2 ;;
+            --force) force=1; shift ;;
+            -q|--quiet) QUIET=1; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    [ -n "$shells" ] || shells=$(detect_shells)
+    [ -n "$shells" ] || die 'no supported shell found'
+
+    command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "'$CLAUDE_BIN' not found in PATH"
+
+    local version installed_version installed_hash
+    version=$(claude_version)
+    [ -n "$version" ] || die "could not read '$CLAUDE_BIN --version'"
+
+    installed_version=$(meta_get claude-version || echo '')
+    installed_hash=$(meta_get spec-hash || echo '')
+
+    # Fast path: same Claude version and every target file still present.
+    if [ -z "$force" ] && [ "$installed_version" = "$version" ]; then
+        local missing=''
+        for target in $shells; do
+            case $target in
+                bash) [ -f "$BASH_DIR/claude" ] || missing=1 ;;
+                zsh)  [ -f "$ZSH_DIR/_claude" ] || missing=1 ;;
+            esac
+        done
+        if [ -z "$missing" ]; then
+            info "Up to date (claude $version)."
+            return 0
+        fi
+    fi
+
+    info "Reading the CLI surface of claude $version ..."
+    local new_spec new_hash
+    new_spec=$(mktemp)
+    build_spec > "$new_spec"
+    [ -s "$new_spec" ] || { rm -f "$new_spec"; die 'failed to parse any options from --help'; }
+    new_hash=$(sha256 < "$new_spec")
+
+    if [ -z "$force" ] && [ "$new_hash" = "$installed_hash" ] && [ -n "$installed_hash" ]; then
+        # The CLI surface is byte-identical. Keep the generated scripts as they
+        # are and only record the new version.
+        for target in $shells; do
+            case $target in
+                bash) bump_version_header "$BASH_DIR/claude" "$version" ;;
+                zsh)  bump_version_header "$ZSH_DIR/_claude" "$version" ;;
+            esac
+        done
+        write_meta "$version" "$new_hash"
+        cat "$new_spec" > "$SPEC_FILE"
+        rm -f "$new_spec"
+        info "claude $version: no command changes since $installed_version. Version bumped, scripts untouched."
+        return 0
+    fi
+
+    if [ -n "$installed_hash" ]; then
+        info "claude $version: CLI surface changed since ${installed_version:-unknown}."
+        spec_diff_summary "$SPEC_FILE" "$new_spec"
+    fi
+
+    for target in $shells; do
+        case $target in
+            bash)
+                mkdir -p "$BASH_DIR"
+                emit_bash "$new_spec" "$version" "$new_hash" > "$BASH_DIR/claude"
+                info "Installed $BASH_DIR/claude"
+                ;;
+            zsh)
+                mkdir -p "$ZSH_DIR"
+                emit_zsh "$new_spec" "$version" "$new_hash" > "$ZSH_DIR/_claude"
+                info "Installed $ZSH_DIR/_claude"
+                ;;
+            *) die "unsupported shell: $target" ;;
+        esac
+    done
+
+    write_meta "$version" "$new_hash"
+    cat "$new_spec" > "$SPEC_FILE"
+    rm -f "$new_spec"
+
+    print_activation "$shells"
+}
+
+write_meta() {
+    mkdir -p "$CACHE_DIR"
+    {
+        printf 'claude-version=%s\n' "$1"
+        printf 'spec-hash=%s\n' "$2"
+        printf 'generator-version=%s\n' "$GENERATOR_VERSION"
+    } > "$META_FILE"
+}
+
+print_activation() {
+    local shells=$1
+    [ -n "${QUIET:-}" ] && return 0
+    printf '\nActivate with:\n'
+    case " $shells " in
+        *" bash "*)
+            printf '  bash — add to ~/.bashrc (or ~/.bash_profile on macOS login shells):\n'
+            printf '    [ -r %s/claude ] && . %s/claude\n' "$BASH_DIR" "$BASH_DIR"
+            printf '    (or install bash-completion@2, which loads that directory for you)\n'
+            ;;
+    esac
+    case " $shells " in
+        *" zsh "*)
+            printf '  zsh  — add to ~/.zshrc, above compinit:\n'
+            printf '    fpath=(%s $fpath)\n' "$ZSH_DIR"
+            printf '    autoload -Uz compinit && compinit\n'
+            ;;
+    esac
+    printf '\nThen open a new shell. Re-run `claude-completions install` after upgrading Claude Code.\n'
+}
+
+cmd_status() {
+    local version installed_version installed_hash
+    version=$(claude_version || echo '')
+    installed_version=$(meta_get claude-version || echo 'not installed')
+    installed_hash=$(meta_get spec-hash || echo '-')
+
+    printf 'generator      %s\n' "$GENERATOR_VERSION"
+    printf 'claude in PATH %s\n' "${version:-not found}"
+    printf 'generated for  %s\n' "$installed_version"
+    printf 'spec hash      %s\n' "$installed_hash"
+    printf 'bash script    %s\n' "$([ -f "$BASH_DIR/claude" ] && echo "$BASH_DIR/claude" || echo 'not installed')"
+    printf 'zsh script     %s\n' "$([ -f "$ZSH_DIR/_claude" ] && echo "$ZSH_DIR/_claude" || echo 'not installed')"
+
+    if [ -n "$version" ] && [ "$version" != "$installed_version" ]; then
+        printf '\nRun `claude-completions install` to check for CLI changes.\n'
+    fi
+}
+
+cmd_generate() {
+    local shell=bash out=''
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --shell) shell=$2; shift 2 ;;
+            -o|--output) out=$2; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    local version spec hash
+    version=$(claude_version)
+    spec=$(mktemp)
+    build_spec > "$spec"
+    hash=$(sha256 < "$spec")
+    if [ -n "$out" ]; then
+        emit_"$shell" "$spec" "$version" "$hash" > "$out"
+    else
+        emit_"$shell" "$spec" "$version" "$hash"
+    fi
+    rm -f "$spec"
+}
+
+cmd_uninstall() {
+    rm -f "$BASH_DIR/claude" "$ZSH_DIR/_claude"
+    rm -rf "$CACHE_DIR"
+    info 'Removed generated completion scripts and cache.'
+    info 'Remove the activation lines from your shell rc by hand.'
+}
+
+usage() {
+    cat <<'EOF'
+claude-completions — shell completions for the Claude Code CLI
+
+USAGE
+  claude-completions install [--shell bash|zsh] [--force] [--quiet]
+  claude-completions status
+  claude-completions generate [--shell bash|zsh] [-o FILE]
+  claude-completions uninstall
+
+The completion scripts are generated from `claude --help`, so they match the
+Claude Code version you have installed.
+
+`install` is also the update path, and it is version-aware:
+
+  * Same Claude version as last time      -> does nothing.
+  * New version, identical CLI surface    -> bumps the recorded version only,
+                                             leaving the scripts byte-identical.
+  * New version, changed CLI surface      -> regenerates and reports which
+                                             options were added or removed.
+
+ENVIRONMENT
+  CLAUDE_BIN                    path to the claude binary (default: claude)
+  CLAUDE_COMPLETIONS_BASH_DIR   where to write the bash script
+  CLAUDE_COMPLETIONS_ZSH_DIR    where to write the zsh script
+EOF
+}
+
+main() {
+    local cmd=${1:-help}
+    [ $# -gt 0 ] && shift
+    case $cmd in
+        install|update|refresh) cmd_install "$@" ;;
+        status)                 cmd_status "$@" ;;
+        generate)               cmd_generate "$@" ;;
+        uninstall)              cmd_uninstall "$@" ;;
+        help|-h|--help)         usage ;;
+        --version)              printf '%s\n' "$GENERATOR_VERSION" ;;
+        *)                      usage; exit 1 ;;
+    esac
+}
+
+main "$@"
